@@ -30,6 +30,17 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
 
+const LEGACY_EMAIL_AUTH = process.env.LEGACY_EMAIL_AUTH !== 'false';
+const TURNSTILE_REQUIRED = process.env.TURNSTILE_REQUIRED === 'true';
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+const TURNSTILE_HOSTNAMES = (process.env.TURNSTILE_HOSTNAMES || '')
+  .split(',')
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+
+const DEVICE_HASH_SECRET =
+  process.env.DEVICE_HASH_SECRET || JWT_SECRET;
+
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
@@ -40,6 +51,11 @@ if (!process.env.DATABASE_URL) {
 
 if (!process.env.JWT_SECRET || JWT_SECRET === 'dev-secret-change-me') {
   console.warn('[Nex] WARNING: Set a strong JWT_SECRET in Render');
+}
+
+if (TURNSTILE_REQUIRED && !TURNSTILE_SECRET_KEY) {
+  console.error('[Nex] TURNSTILE_REQUIRED is true but secret key is missing');
+  process.exit(1);
 }
 
 const pool = new Pool({
@@ -63,7 +79,6 @@ const emptyDb = () => ({
   gifts: {},
   numbers: {},
   numOtps: {},
-
   // Messages are deliberately RAM-only.
   msgs: [],
   seq: 0,
@@ -74,9 +89,7 @@ function fill(data) {
 
   if (data && typeof data === 'object') {
     for (const key of Object.keys(result)) {
-      if (data[key] != null) {
-        result[key] = data[key];
-      }
+      if (data[key] != null) result[key] = data[key];
     }
   }
 
@@ -100,8 +113,6 @@ function fill(data) {
 
 let db = emptyDb();
 let dbReady = false;
-
-// Serialize writes so snapshots are not written out of order.
 let saveQueue = Promise.resolve();
 
 function persistentSnapshot(source) {
@@ -114,8 +125,6 @@ function persistentSnapshot(source) {
     gifts: source.gifts || {},
     numbers: source.numbers || {},
     numOtps: source.numOtps || {},
-
-    // Only the numeric cursor is persisted.
     // Message contents are NEVER included.
     seq: Number.isSafeInteger(source.seq) ? source.seq : 0,
   };
@@ -162,9 +171,7 @@ async function persistOrRespond(source, res) {
   const saved = await save(source);
 
   if (!saved) {
-    res.status(503).json({
-      error: 'database_unavailable',
-    });
+    res.status(503).json({ error: 'database_unavailable' });
     return false;
   }
 
@@ -178,11 +185,8 @@ function readLegacyDb() {
       return null;
     }
 
-    const raw = fs.readFileSync(DB_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-
+    const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
     console.log('[Nex DB] Legacy db.json found');
-
     return fill(parsed);
   } catch (error) {
     console.error('[Nex DB] Could not read legacy db.json:', error.message);
@@ -205,17 +209,12 @@ async function initDatabase() {
 
   if (existing.rows.length > 0) {
     db = fill(existing.rows[0].state);
-
-    // Never restore messages from the database.
     db.msgs = [];
-
     console.log('[Nex DB] Existing Neon state loaded');
   } else {
     const legacy = readLegacyDb();
 
     if (legacy) {
-      // Import persistent account and inventory data only.
-      // Old messages are intentionally discarded.
       db = fill(persistentSnapshot(legacy));
       db.msgs = [];
 
@@ -227,11 +226,11 @@ async function initDatabase() {
         [JSON.stringify(persistentSnapshot(db))]
       );
 
-      if (imported.rowCount > 0) {
-        console.log('[Nex DB] Legacy data imported into Neon');
-      } else {
-        console.log('[Nex DB] Another instance initialized the database; loading Neon state');
-      }
+      console.log(
+        imported.rowCount > 0
+          ? '[Nex DB] Legacy data imported into Neon'
+          : '[Nex DB] Another instance initialized the database'
+      );
 
       const actual = await pool.query(
         'SELECT state FROM nex_app_state WHERE id = 1'
@@ -265,7 +264,6 @@ async function initDatabase() {
   }
 
   dbReady = true;
-
   console.log('[Nex DB] Connected to Neon PostgreSQL');
   console.log('[Nex DB] Messages are RAM-only');
 }
@@ -285,25 +283,14 @@ let transporter = null;
 function getTransporter() {
   if (transporter) return transporter;
 
-  const {
-    SMTP_HOST,
-    SMTP_PORT,
-    SMTP_USER,
-    SMTP_PASS,
-  } = process.env;
-
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
   if (!SMTP_HOST) return null;
 
   transporter = nodemailer.createTransport({
     host: SMTP_HOST,
     port: Number(SMTP_PORT || 587),
     secure: Number(SMTP_PORT) === 465,
-    auth: SMTP_USER
-      ? {
-          user: SMTP_USER,
-          pass: SMTP_PASS,
-        }
-      : undefined,
+    auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
   });
 
   return transporter;
@@ -311,107 +298,54 @@ function getTransporter() {
 
 async function sendOtp(email, code) {
   const from = process.env.MAIL_FROM || 'Nex <noreply@nex.app>';
-
   const subject = 'Your Nex verification code';
-
   const text =
     `Your Nex verification code is: ${code}\n\n` +
     'This code expires in 10 minutes.';
 
   const html = `
-    <div style="
-      font-family:Arial,sans-serif;
-      max-width:480px;
-      margin:auto;
-      padding:24px;
-      color:#222;
-    ">
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#222">
       <h2 style="color:#2AABEE">Nex</h2>
-      <p>Your verification code:</p>
-      <div style="
-        font-size:32px;
-        font-weight:bold;
-        letter-spacing:8px;
-        padding:16px 0;
-      ">${code}</div>
-      <p style="color:#777;font-size:13px">
-        This code expires in 10 minutes.
-      </p>
-      <p style="color:#999;font-size:12px">
-        If you did not request this code, ignore this email.
-      </p>
+      <p>Your Nex verification code:</p>
+      <div style="font-size:32px;font-weight:bold;letter-spacing:8px;padding:16px 0">${code}</div>
+      <p style="color:#777;font-size:13px">This code expires in 10 minutes.</p>
+      <p style="color:#999;font-size:12px">If you did not request this code, ignore this email.</p>
     </div>
   `;
 
   if (process.env.RESEND_API_KEY) {
-    const response = await fetch(
-      'https://api.resend.com/emails',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          from,
-          to: [email],
-          subject,
-          text,
-          html,
-        }),
-        signal: AbortSignal.timeout(15000),
-      }
-    );
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from, to: [email], subject, text, html }),
+      signal: AbortSignal.timeout(15000),
+    });
 
     if (!response.ok) {
       const error = await response.text();
-
-      console.error(
-        '[Nex mail] Resend error:',
-        response.status,
-        error.slice(0, 500)
-      );
-
+      console.error('[Nex mail] Resend error:', response.status, error.slice(0, 500));
       throw new Error('Email delivery failed');
     }
 
     const result = await response.json();
-
     console.log('[Nex mail] Sent through Resend');
-
-    return {
-      sent: true,
-      provider: 'resend',
-      messageId: result.id,
-    };
+    return { sent: true, provider: 'resend', messageId: result.id };
   }
 
   const tx = getTransporter();
 
   if (tx) {
-    await tx.sendMail({
-      from,
-      to: email,
-      subject,
-      text,
-      html,
-    });
-
+    await tx.sendMail({ from, to: email, subject, text, html });
     console.log('[Nex mail] Sent through SMTP');
-
-    return {
-      sent: true,
-      provider: 'smtp',
-    };
+    return { sent: true, provider: 'smtp' };
   }
 
   if (process.env.NODE_ENV !== 'production') {
     console.log(`[Nex mail:dev] OTP for ${email}: ${code}`);
-
-    return {
-      dev: true,
-      code,
-    };
+    return { dev: true, code };
   }
 
   throw new Error('Email provider is not configured');
@@ -421,14 +355,125 @@ async function sendOtp(email, code) {
 // VALIDATION
 // ==========================================
 
-const normEmail = (email) =>
-  String(email || '').trim().toLowerCase();
+const normEmail = (email) => String(email || '').trim().toLowerCase();
+const validEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+const validUsername = (username) => /^[a-z0-9_]{3,24}$/.test(username);
 
-const validEmail = (email) =>
-  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+function validPassword(password) {
+  if (typeof password !== 'string') return false;
+  const bytes = Buffer.byteLength(password, 'utf8');
+  return bytes >= 8 && bytes <= 72;
+}
 
-const validUsername = (username) =>
-  /^[a-z0-9_]{3,24}$/.test(username);
+function passwordError(password) {
+  if (typeof password !== 'string' || password.length < 8) {
+    return 'password_too_short';
+  }
+  if (Buffer.byteLength(password, 'utf8') > 72) {
+    return 'password_too_long';
+  }
+  return null;
+}
+
+// ==========================================
+// RATE LIMITS / DEVICE SIGNAL
+// ==========================================
+
+const rateBuckets = new Map();
+const deviceAccounts = new Map();
+
+function requestIp(req) {
+  return String(req.ip || req.socket?.remoteAddress || 'unknown').slice(0, 100);
+}
+
+function takeRateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  const current = rateBuckets.get(key);
+
+  if (!current || now - current.start >= windowMs) {
+    rateBuckets.set(key, { start: now, count: 1 });
+    return true;
+  }
+
+  current.count += 1;
+  return current.count <= limit;
+}
+
+function enforceRateLimit(req, res, key, limit, windowMs) {
+  if (takeRateLimit(key, limit, windowMs)) return true;
+
+  res.status(429).json({
+    error: 'rate_limited',
+    retryAfter: Math.max(
+      1,
+      Math.ceil((rateBuckets.get(key).start + windowMs - Date.now()) / 1000)
+    ),
+  });
+
+  return false;
+}
+
+function requestDeviceHash(req) {
+  const raw = String(req.headers['x-nex-device'] || '').trim();
+
+  if (!raw || raw.length < 16 || raw.length > 128) return null;
+
+  return crypto
+    .createHmac('sha256', DEVICE_HASH_SECRET)
+    .update(raw)
+    .digest('hex');
+}
+
+function recordDevice(user, deviceHash) {
+  if (!deviceHash) return;
+
+  user.devices = Array.isArray(user.devices) ? user.devices : [];
+
+  if (!user.devices.includes(deviceHash)) {
+    user.devices.push(deviceHash);
+    if (user.devices.length > 10) user.devices.shift();
+  }
+
+  deviceAccounts.set(deviceHash, (deviceAccounts.get(deviceHash) || 0) + 1);
+}
+
+async function verifyTurnstile(token, req) {
+  if (!TURNSTILE_REQUIRED) return true;
+  if (!TURNSTILE_SECRET_KEY || !token || typeof token !== 'string') return false;
+
+  try {
+    const response = await fetch(
+      'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          secret: TURNSTILE_SECRET_KEY,
+          response: token,
+          remoteip: requestIp(req),
+        }),
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+
+    if (!response.ok) return false;
+
+    const result = await response.json();
+    if (!result.success) return false;
+
+    if (
+      TURNSTILE_HOSTNAMES.length &&
+      !TURNSTILE_HOSTNAMES.includes(String(result.hostname || '').toLowerCase())
+    ) {
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error('[Turnstile] Verification failed:', error.message);
+    return false;
+  }
+}
 
 // ==========================================
 // USERS
@@ -455,6 +500,7 @@ function mePayload(user, balance) {
     exp: user.exp || null,
     numbers: numList(user),
     gifts: source.gifts[user.id] || [],
+    passwordSet: !!user.passwordHash,
   };
 }
 
@@ -463,33 +509,22 @@ function mePayload(user, balance) {
 // ==========================================
 
 function signToken(userId) {
-  return jwt.sign(
-    { sub: userId },
-    JWT_SECRET,
-    { expiresIn: '30d' }
-  );
+  return jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: '30d' });
 }
 
 function auth(req, res, next) {
   const header = req.headers.authorization || '';
-
-  const token = header.startsWith('Bearer ')
-    ? header.slice(7)
-    : null;
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
 
   if (!token) {
-    return res.status(401).json({
-      error: 'unauthorized',
-    });
+    return res.status(401).json({ error: 'unauthorized' });
   }
 
   try {
     req.userId = jwt.verify(token, JWT_SECRET).sub;
     next();
   } catch {
-    return res.status(401).json({
-      error: 'invalid_token',
-    });
+    return res.status(401).json({ error: 'invalid_token' });
   }
 }
 
@@ -499,14 +534,30 @@ function auth(req, res, next) {
 
 const app = express();
 
+// Render is behind one trusted proxy.
+app.set('trust proxy', 1);
+
 app.use(cors({
   origin: true,
   credentials: true,
 }));
 
-app.use(express.json({
-  limit: '256kb',
-}));
+app.use(express.json({ limit: '256kb' }));
+
+// ==========================================
+// AUTH CONFIG
+// ==========================================
+
+app.get('/auth/config', (_req, res) => {
+  res.json({
+    registration: 'username_password',
+    login: 'username_password',
+    legacyEmailAuth: LEGACY_EMAIL_AUTH,
+    turnstileRequired: TURNSTILE_REQUIRED,
+    turnstileSiteKey: process.env.TURNSTILE_SITE_KEY || '',
+    deviceHeader: 'X-Nex-Device',
+  });
+});
 
 // ==========================================
 // HEALTH
@@ -524,31 +575,270 @@ app.get('/health', (_req, res) => {
 app.get('/', (_req, res) => {
   res.json({
     name: 'Nex API',
-    version: '1.0.0',
+    version: '1.1.0',
     health: '/health',
   });
 });
+// ==========================================
+// AUTH: REGISTER WITH USERNAME + PASSWORD
+// ==========================================
+
+app.post('/auth/register', async (req, res) => {
+  try {
+    const ip = requestIp(req);
+
+    if (!enforceRateLimit(req, res, `register:ip:${ip}`, 5, 60 * 60 * 1000)) {
+      return;
+    }
+
+    const username = String(req.body.username || '').trim().toLowerCase();
+    const password = req.body.password;
+    const name = String(req.body.name || username).trim();
+    const deviceHash = requestDeviceHash(req);
+
+    if (!validUsername(username)) {
+      return res.status(400).json({ error: 'invalid_username' });
+    }
+
+    const passError = passwordError(password);
+    if (passError) {
+      return res.status(400).json({ error: passError });
+    }
+
+    if (name.length < 2 || name.length > 32) {
+      return res.status(400).json({ error: 'invalid_name' });
+    }
+
+    if (TURNSTILE_REQUIRED) {
+      const valid = await verifyTurnstile(req.body.turnstileToken, req);
+      if (!valid) {
+        return res.status(403).json({ error: 'turnstile_failed' });
+      }
+    }
+
+    if (deviceHash) {
+      if (!enforceRateLimit(
+        req,
+        res,
+        `register:device:${deviceHash}`,
+        3,
+        24 * 60 * 60 * 1000
+      )) {
+        return;
+      }
+    }
+
+    if (!enforceRateLimit(
+      req,
+      res,
+      `register:username:${username}`,
+      5,
+      60 * 60 * 1000
+    )) {
+      return;
+    }
+
+    const source = load();
+
+    if (source.usernames[username]) {
+      return res.status(409).json({ error: 'username_taken' });
+    }
+
+    const id = nanoid(12);
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const user = {
+      id,
+      email: '',
+      name,
+      username,
+      passwordHash,
+      createdAt: Date.now(),
+      devices: [],
+    };
+
+    recordDevice(user, deviceHash);
+
+    source.users[id] = user;
+    source.usernames[username] = id;
+    source.gifts[id] = [];
+
+    svcMsg(
+      source,
+      id,
+      'Добро пожаловать в Nex! Аккаунт успешно создан.'
+    );
+
+    if (!(await persistOrRespond(source, res))) return;
+
+    res.status(201).json({
+      token: signToken(id),
+      user: mePayload(user, balanceOf(source, id)),
+    });
+  } catch (error) {
+    console.error('[auth/register]', error);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
 
 // ==========================================
-// AUTH: REQUEST EMAIL CODE
+// AUTH: LOGIN WITH USERNAME + PASSWORD
+// ==========================================
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const ip = requestIp(req);
+    const username = String(req.body.username || '').trim().toLowerCase();
+    const password = req.body.password;
+    const deviceHash = requestDeviceHash(req);
+
+    if (!validUsername(username) || typeof password !== 'string') {
+      return res.status(400).json({ error: 'invalid_credentials' });
+    }
+
+    if (!enforceRateLimit(req, res, `login:ip:${ip}`, 30, 15 * 60 * 1000)) {
+      return;
+    }
+
+    if (!enforceRateLimit(
+      req,
+      res,
+      `login:user:${username}`,
+      10,
+      15 * 60 * 1000
+    )) {
+      return;
+    }
+
+    if (TURNSTILE_REQUIRED) {
+      const valid = await verifyTurnstile(req.body.turnstileToken, req);
+      if (!valid) {
+        return res.status(403).json({ error: 'turnstile_failed' });
+      }
+    }
+
+    const source = load();
+    const userId = source.usernames[username];
+    const user = userId ? source.users[userId] : null;
+
+    if (!user || user.guest) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
+
+    // Old accounts can set a password after signing in through email OTP.
+    if (!user.passwordHash) {
+      return res.status(409).json({ error: 'password_not_set' });
+    }
+
+    const ok = await bcrypt.compare(password, user.passwordHash);
+
+    if (!ok) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
+
+    recordDevice(user, deviceHash);
+    user.lastLoginAt = Date.now();
+
+    if (!(await persistOrRespond(source, res))) return;
+
+    res.json({
+      token: signToken(user.id),
+      user: mePayload(user, balanceOf(source, user.id)),
+    });
+  } catch (error) {
+    console.error('[auth/login]', error);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ==========================================
+// AUTH: SET PASSWORD FOR EXISTING ACCOUNT
+// ==========================================
+
+app.post('/auth/set-password', auth, async (req, res) => {
+  try {
+    const source = load();
+    const user = source.users[req.userId];
+
+    if (!user) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    if (user.guest) {
+      return res.status(403).json({ error: 'guest_forbidden' });
+    }
+
+    const password = req.body.password;
+    const passError = passwordError(password);
+
+    if (passError) {
+      return res.status(400).json({ error: passError });
+    }
+
+    // If the account already has a password, require the old one.
+    if (user.passwordHash) {
+      if (typeof req.body.currentPassword !== 'string') {
+        return res.status(400).json({ error: 'current_password_required' });
+      }
+
+      const matches = await bcrypt.compare(
+        req.body.currentPassword,
+        user.passwordHash
+      );
+
+      if (!matches) {
+        return res.status(401).json({ error: 'current_password_invalid' });
+      }
+    }
+
+    user.passwordHash = await bcrypt.hash(password, 12);
+
+    if (!(await persistOrRespond(source, res))) return;
+
+    res.json({
+      ok: true,
+      passwordSet: true,
+    });
+  } catch (error) {
+    console.error('[auth/set-password]', error);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// ==========================================
+// AUTH: REQUEST EMAIL CODE (LEGACY)
 // ==========================================
 
 app.post('/auth/email', async (req, res) => {
   try {
+    if (!LEGACY_EMAIL_AUTH) {
+      return res.status(403).json({ error: 'legacy_email_auth_disabled' });
+    }
+
+    const ip = requestIp(req);
+
+    if (!enforceRateLimit(req, res, `email:ip:${ip}`, 5, 60 * 60 * 1000)) {
+      return;
+    }
+
     const email = normEmail(req.body.email);
 
     if (!validEmail(email)) {
-      return res.status(400).json({
-        error: 'invalid_email',
-      });
+      return res.status(400).json({ error: 'invalid_email' });
     }
 
-    const code = String(
-      crypto.randomInt(100000, 999999)
-    );
+    if (!enforceRateLimit(
+      req,
+      res,
+      `email:address:${email}`,
+      3,
+      15 * 60 * 1000
+    )) {
+      return;
+    }
 
+    const code = String(crypto.randomInt(100000, 999999));
     const hash = await bcrypt.hash(code, 8);
-
     const source = load();
 
     source.otps[email] = {
@@ -560,51 +850,56 @@ app.post('/auth/email', async (req, res) => {
     if (!(await persistOrRespond(source, res))) return;
 
     const result = await sendOtp(email, code);
-
     const out = {
       ok: true,
       expiresIn: OTP_TTL_MS / 1000,
     };
 
-    if (
-      result.dev &&
-      process.env.NODE_ENV !== 'production'
-    ) {
+    if (result.dev && process.env.NODE_ENV !== 'production') {
       out.devCode = code;
     }
 
     res.json(out);
   } catch (error) {
     console.error('[auth/email]', error);
-
-    res.status(500).json({
-      error: 'server_error',
-    });
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
 // ==========================================
-// AUTH: VERIFY EMAIL CODE
+// AUTH: VERIFY EMAIL CODE (LEGACY / RECOVERY)
 // ==========================================
 
 app.post('/auth/verify', async (req, res) => {
   try {
+    const ip = requestIp(req);
+
+    if (!enforceRateLimit(req, res, `verify:ip:${ip}`, 20, 15 * 60 * 1000)) {
+      return;
+    }
+
     const email = normEmail(req.body.email);
     const code = String(req.body.code || '');
 
     if (!validEmail(email) || !/^\d{6}$/.test(code)) {
-      return res.status(400).json({
-        error: 'invalid_request',
-      });
+      return res.status(400).json({ error: 'invalid_request' });
+    }
+
+    if (!enforceRateLimit(
+      req,
+      res,
+      `verify:email:${email}`,
+      10,
+      15 * 60 * 1000
+    )) {
+      return;
     }
 
     const source = load();
     const otp = source.otps[email];
 
     if (!otp) {
-      return res.status(400).json({
-        error: 'otp_not_found',
-      });
+      return res.status(400).json({ error: 'otp_not_found' });
     }
 
     if (Date.now() > otp.exp) {
@@ -612,15 +907,11 @@ app.post('/auth/verify', async (req, res) => {
 
       if (!(await persistOrRespond(source, res))) return;
 
-      return res.status(400).json({
-        error: 'otp_expired',
-      });
+      return res.status(400).json({ error: 'otp_expired' });
     }
 
     if (otp.attempts >= OTP_MAX_ATTEMPTS) {
-      return res.status(429).json({
-        error: 'otp_locked',
-      });
+      return res.status(429).json({ error: 'otp_locked' });
     }
 
     otp.attempts += 1;
@@ -629,21 +920,22 @@ app.post('/auth/verify', async (req, res) => {
 
     if (!ok) {
       if (!(await persistOrRespond(source, res))) return;
-
-      return res.status(400).json({
-        error: 'otp_invalid',
-      });
+      return res.status(400).json({ error: 'otp_invalid' });
     }
 
     delete source.otps[email];
 
     let userId = source.emails[email];
-
-    let user = userId
-      ? source.users[userId]
-      : null;
+    let user = userId ? source.users[userId] : null;
 
     if (!user) {
+      // When legacy registration is disabled, email OTP may recover
+      // existing accounts but cannot create new ones.
+      if (!LEGACY_EMAIL_AUTH) {
+        if (!(await persistOrRespond(source, res))) return;
+        return res.status(403).json({ error: 'legacy_registration_disabled' });
+      }
+
       userId = nanoid(12);
 
       const base = email
@@ -684,17 +976,11 @@ app.post('/auth/verify', async (req, res) => {
 
     res.json({
       token: signToken(userId),
-      user: mePayload(
-        user,
-        balanceOf(source, userId)
-      ),
+      user: mePayload(user, balanceOf(source, userId)),
     });
   } catch (error) {
     console.error('[auth/verify]', error);
-
-    res.status(500).json({
-      error: 'server_error',
-    });
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
@@ -707,14 +993,10 @@ app.get('/me', auth, (req, res) => {
   const user = source.users[req.userId];
 
   if (!user) {
-    return res.status(404).json({
-      error: 'not_found',
-    });
+    return res.status(404).json({ error: 'not_found' });
   }
 
-  res.json(
-    mePayload(user, balanceOf(source, req.userId))
-  );
+  res.json(mePayload(user, balanceOf(source, req.userId)));
 });
 
 // ==========================================
@@ -726,53 +1008,40 @@ app.patch('/me', auth, async (req, res) => {
   const user = source.users[req.userId];
 
   if (!user) {
-    return res.status(404).json({
-      error: 'not_found',
-    });
+    return res.status(404).json({ error: 'not_found' });
   }
 
   if (req.body.name != null) {
     const name = String(req.body.name).trim();
 
     if (name.length < 2 || name.length > 32) {
-      return res.status(400).json({
-        error: 'invalid_name',
-      });
+      return res.status(400).json({ error: 'invalid_name' });
     }
 
     user.name = name;
   }
 
   if (req.body.username != null) {
-    const username = String(req.body.username)
-      .trim()
-      .toLowerCase();
+    const username = String(req.body.username).trim().toLowerCase();
 
     if (!validUsername(username)) {
-      return res.status(400).json({
-        error: 'invalid_username',
-      });
+      return res.status(400).json({ error: 'invalid_username' });
     }
 
     const taken = source.usernames[username];
 
     if (taken && taken !== req.userId) {
-      return res.status(409).json({
-        error: 'username_taken',
-      });
+      return res.status(409).json({ error: 'username_taken' });
     }
 
     delete source.usernames[user.username];
-
     user.username = username;
     source.usernames[username] = req.userId;
   }
 
   if (!(await persistOrRespond(source, res))) return;
 
-  res.json(
-    mePayload(user, balanceOf(source, req.userId))
-  );
+  res.json(mePayload(user, balanceOf(source, req.userId)));
 });
 
 // ==========================================
@@ -785,9 +1054,7 @@ app.get('/users/search', auth, (req, res) => {
     .replace(/^@/, '')
     .trim();
 
-  if (q.length < 2) {
-    return res.json({ users: [] });
-  }
+  if (q.length < 2) return res.json({ users: [] });
 
   const source = load();
 
@@ -808,24 +1075,15 @@ app.get('/users/search', auth, (req, res) => {
 
 app.get('/users/:username', auth, (req, res) => {
   const source = load();
-
   const id = source.usernames[
     String(req.params.username || '').toLowerCase()
   ];
 
-  if (!id) {
-    return res.status(404).json({
-      error: 'not_found',
-    });
-  }
+  if (!id) return res.status(404).json({ error: 'not_found' });
 
   const user = source.users[id];
 
-  if (!user) {
-    return res.status(404).json({
-      error: 'not_found',
-    });
-  }
+  if (!user) return res.status(404).json({ error: 'not_found' });
 
   res.json({
     ...publicUser(user, undefined),
@@ -837,15 +1095,12 @@ app.get('/users/:username', auth, (req, res) => {
     })),
   });
 });
-
 // ==========================================
 // WALLET
 // ==========================================
 
 app.get('/wallet', auth, (req, res) => {
-  res.json({
-    balance: balanceOf(load(), req.userId),
-  });
+  res.json({ balance: balanceOf(load(), req.userId) });
 });
 
 // ==========================================
@@ -876,9 +1131,7 @@ app.post('/wallet/topup-test', auth, async (req, res) => {
   const source = load();
 
   if (!source.users[req.userId]) {
-    return res.status(404).json({
-      error: 'not_found',
-    });
+    return res.status(404).json({ error: 'not_found' });
   }
 
   const recent = source.ledger
@@ -889,9 +1142,7 @@ app.post('/wallet/topup-test', auth, async (req, res) => {
     .slice(-1)[0];
 
   if (recent && Date.now() - recent.ts < 10000) {
-    return res.status(429).json({
-      error: 'rate_limited',
-    });
+    return res.status(429).json({ error: 'rate_limited' });
   }
 
   const entry = {
@@ -935,8 +1186,7 @@ const NUM_POOL = [
   ['+88801000001', 3000],
 ];
 
-const normNum = (n) =>
-  '+' + String(n || '').replace(/\D/g, '');
+const normNum = (n) => '+' + String(n || '').replace(/\D/g, '');
 
 const fmtNum = (n) =>
   String(n).replace(/^\+888(\d{4})(\d{4})$/, '+888 $1 $2');
@@ -950,11 +1200,7 @@ const numList = (user) =>
 
 function nextSeq(source) {
   const previous = Number.isSafeInteger(source.seq) ? source.seq : 0;
-
-  // Timestamp-based cursor avoids resetting to zero after a restart.
-  // It stores no message content.
   source.seq = Math.max(previous + 1, Date.now());
-
   return source.seq;
 }
 
@@ -990,9 +1236,7 @@ function resolveUser(source, key) {
 }
 
 function debit(source, user, amount, reason) {
-  if (balanceOf(source, user.id) < amount) {
-    return false;
-  }
+  if (balanceOf(source, user.id) < amount) return false;
 
   source.ledger.push({
     id: nanoid(10),
@@ -1024,33 +1268,19 @@ function actor(req, res, { noGuest } = {}) {
     return null;
   }
 
-  return {
-    db: source,
-    u: user,
-  };
+  return { db: source, u: user };
 }
 
 // ==========================================
 // GUEST
 // ==========================================
 
-const guestHits = new Map();
-
 app.post('/auth/guest', async (req, res) => {
-  const ip = req.ip || 'x';
+  const ip = requestIp(req);
 
-  const hits = (guestHits.get(ip) || []).filter(
-    (time) => Date.now() - time < 3600000
-  );
-
-  if (hits.length >= 20) {
-    return res.status(429).json({
-      error: 'rate_limited',
-    });
+  if (!enforceRateLimit(req, res, `guest:ip:${ip}`, 5, 60 * 60 * 1000)) {
+    return;
   }
-
-  hits.push(Date.now());
-  guestHits.set(ip, hits);
 
   const source = load();
   const id = nanoid(12);
@@ -1086,11 +1316,7 @@ app.post('/auth/guest', async (req, res) => {
   if (!(await persistOrRespond(source, res))) return;
 
   res.json({
-    token: jwt.sign(
-      { sub: id },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    ),
+    token: jwt.sign({ sub: id }, JWT_SECRET, { expiresIn: '24h' }),
     user: mePayload(user, 0),
   });
 });
@@ -1120,7 +1346,6 @@ setInterval(async () => {
     (message) => !ids.has(message.from) && !ids.has(message.to)
   );
 
-  // Background task: no HTTP response to send.
   await save(source);
 }, 60 * 60 * 1000);
 
@@ -1130,34 +1355,32 @@ setInterval(async () => {
 
 app.post('/auth/number', async (req, res) => {
   try {
+    const ip = requestIp(req);
+
+    if (!enforceRateLimit(req, res, `numauth:ip:${ip}`, 10, 15 * 60 * 1000)) {
+      return;
+    }
+
     const number = normNum(req.body.number);
 
     if (!/^\+888\d{8}$/.test(number)) {
-      return res.status(400).json({
-        error: 'invalid_number',
-      });
+      return res.status(400).json({ error: 'invalid_number' });
     }
 
     const source = load();
     const owner = source.users[source.numbers[number]];
 
     if (!owner) {
-      return res.status(404).json({
-        error: 'number_not_found',
-      });
+      return res.status(404).json({ error: 'number_not_found' });
     }
 
     const previous = source.numOtps[number];
 
     if (previous && Date.now() - previous.ts < 30000) {
-      return res.status(429).json({
-        error: 'rate_limited',
-      });
+      return res.status(429).json({ error: 'rate_limited' });
     }
 
-    const code = String(
-      crypto.randomInt(100000, 999999)
-    );
+    const code = String(crypto.randomInt(100000, 999999));
 
     source.numOtps[number] = {
       hash: await bcrypt.hash(code, 8),
@@ -1174,37 +1397,33 @@ app.post('/auth/number', async (req, res) => {
 
     if (!(await persistOrRespond(source, res))) return;
 
-    res.json({
-      ok: true,
-      expiresIn: OTP_TTL_MS / 1000,
-    });
+    res.json({ ok: true, expiresIn: OTP_TTL_MS / 1000 });
   } catch (error) {
     console.error('[auth/number]', error);
-
-    res.status(500).json({
-      error: 'server_error',
-    });
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
 app.post('/auth/number/verify', async (req, res) => {
   try {
+    const ip = requestIp(req);
+
+    if (!enforceRateLimit(req, res, `numverify:ip:${ip}`, 15, 15 * 60 * 1000)) {
+      return;
+    }
+
     const number = normNum(req.body.number);
     const code = String(req.body.code || '');
 
     if (!/^\+888\d{8}$/.test(number) || !/^\d{6}$/.test(code)) {
-      return res.status(400).json({
-        error: 'invalid_request',
-      });
+      return res.status(400).json({ error: 'invalid_request' });
     }
 
     const source = load();
     const otp = source.numOtps[number];
 
     if (!otp) {
-      return res.status(400).json({
-        error: 'otp_not_found',
-      });
+      return res.status(400).json({ error: 'otp_not_found' });
     }
 
     if (Date.now() > otp.exp) {
@@ -1212,25 +1431,18 @@ app.post('/auth/number/verify', async (req, res) => {
 
       if (!(await persistOrRespond(source, res))) return;
 
-      return res.status(400).json({
-        error: 'otp_expired',
-      });
+      return res.status(400).json({ error: 'otp_expired' });
     }
 
     if (otp.attempts >= OTP_MAX_ATTEMPTS) {
-      return res.status(429).json({
-        error: 'otp_locked',
-      });
+      return res.status(429).json({ error: 'otp_locked' });
     }
 
     otp.attempts += 1;
 
     if (!(await bcrypt.compare(code, otp.hash))) {
       if (!(await persistOrRespond(source, res))) return;
-
-      return res.status(400).json({
-        error: 'otp_invalid',
-      });
+      return res.status(400).json({ error: 'otp_invalid' });
     }
 
     delete source.numOtps[number];
@@ -1240,9 +1452,7 @@ app.post('/auth/number/verify', async (req, res) => {
     if (!(await persistOrRespond(source, res))) return;
 
     if (!user) {
-      return res.status(404).json({
-        error: 'number_not_found',
-      });
+      return res.status(404).json({ error: 'number_not_found' });
     }
 
     res.json({
@@ -1251,10 +1461,7 @@ app.post('/auth/number/verify', async (req, res) => {
     });
   } catch (error) {
     console.error('[auth/number/verify]', error);
-
-    res.status(500).json({
-      error: 'server_error',
-    });
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
@@ -1290,21 +1497,15 @@ app.post('/numbers/buy', auth, async (req, res) => {
   if (!c) return;
 
   const { db: source, u: user } = c;
-
   const number = normNum(req.body.number);
-
   const item = NUM_POOL.find(([n]) => n === number);
 
   if (!item) {
-    return res.status(404).json({
-      error: 'number_not_found',
-    });
+    return res.status(404).json({ error: 'number_not_found' });
   }
 
   if (source.numbers[number]) {
-    return res.status(409).json({
-      error: 'number_taken',
-    });
+    return res.status(409).json({ error: 'number_taken' });
   }
 
   const recipient = req.body.to
@@ -1312,33 +1513,21 @@ app.post('/numbers/buy', auth, async (req, res) => {
     : user;
 
   if (!recipient) {
-    return res.status(404).json({
-      error: 'recipient_not_found',
-    });
+    return res.status(404).json({ error: 'recipient_not_found' });
   }
 
   if (recipient.guest) {
-    return res.status(400).json({
-      error: 'recipient_guest',
-    });
+    return res.status(400).json({ error: 'recipient_guest' });
   }
 
   if (!debit(source, user, item[1], 'number_buy')) {
-    return res.status(402).json({
-      error: 'insufficient_funds',
-    });
+    return res.status(402).json({ error: 'insufficient_funds' });
   }
 
   source.numbers[number] = recipient.id;
+  recipient.numbers = [...(recipient.numbers || []), number];
 
-  recipient.numbers = [
-    ...(recipient.numbers || []),
-    number,
-  ];
-
-  if (!recipient.mainNumber) {
-    recipient.mainNumber = number;
-  }
+  if (!recipient.mainNumber) recipient.mainNumber = number;
 
   if (recipient.id !== user.id) {
     addMsg(source, {
@@ -1367,18 +1556,14 @@ app.post('/numbers/main', auth, async (req, res) => {
   const number = normNum(req.body.number);
 
   if (!(c.u.numbers || []).includes(number)) {
-    return res.status(404).json({
-      error: 'number_not_owned',
-    });
+    return res.status(404).json({ error: 'number_not_owned' });
   }
 
   c.u.mainNumber = number;
 
   if (!(await persistOrRespond(c.db, res))) return;
 
-  res.json({
-    numbers: numList(c.u),
-  });
+  res.json({ numbers: numList(c.u) });
 });
 
 // ==========================================
@@ -1390,44 +1575,30 @@ app.post('/numbers/give', auth, async (req, res) => {
   if (!c) return;
 
   const { db: source, u: user } = c;
-
   const number = normNum(req.body.number);
   const recipient = resolveUser(source, req.body.to);
 
   if (!(user.numbers || []).includes(number)) {
-    return res.status(404).json({
-      error: 'number_not_owned',
-    });
+    return res.status(404).json({ error: 'number_not_owned' });
   }
 
   if (!recipient || recipient.id === user.id) {
-    return res.status(404).json({
-      error: 'recipient_not_found',
-    });
+    return res.status(404).json({ error: 'recipient_not_found' });
   }
 
   if (recipient.guest) {
-    return res.status(400).json({
-      error: 'recipient_guest',
-    });
+    return res.status(400).json({ error: 'recipient_guest' });
   }
 
-  user.numbers = user.numbers.filter(
-    (item) => item !== number
-  );
+  user.numbers = user.numbers.filter((item) => item !== number);
 
   if (user.mainNumber === number) {
     user.mainNumber = user.numbers[0] || null;
   }
 
-  recipient.numbers = [
-    ...(recipient.numbers || []),
-    number,
-  ];
+  recipient.numbers = [...(recipient.numbers || []), number];
 
-  if (!recipient.mainNumber) {
-    recipient.mainNumber = number;
-  }
+  if (!recipient.mainNumber) recipient.mainNumber = number;
 
   source.numbers[number] = recipient.id;
 
@@ -1439,9 +1610,7 @@ app.post('/numbers/give', auth, async (req, res) => {
 
   if (!(await persistOrRespond(source, res))) return;
 
-  res.json({
-    numbers: numList(user),
-  });
+  res.json({ numbers: numList(user) });
 });
 
 // ==========================================
@@ -1454,21 +1623,14 @@ app.post('/gifts/send', auth, async (req, res) => {
 
   const { db: source, u: user } = c;
 
-  const recipient = resolveUser(
-    source,
-    req.body.to || user.id
-  );
+  const recipient = resolveUser(source, req.body.to || user.id);
 
   if (!recipient) {
-    return res.status(404).json({
-      error: 'recipient_not_found',
-    });
+    return res.status(404).json({ error: 'recipient_not_found' });
   }
 
   if (recipient.guest) {
-    return res.status(400).json({
-      error: 'recipient_guest',
-    });
+    return res.status(400).json({ error: 'recipient_guest' });
   }
 
   const inventory = (
@@ -1483,15 +1645,11 @@ app.post('/gifts/send', auth, async (req, res) => {
     );
 
     if (index < 0) {
-      return res.status(404).json({
-        error: 'item_not_found',
-      });
+      return res.status(404).json({ error: 'item_not_found' });
     }
 
     if (recipient.id === user.id) {
-      return res.status(400).json({
-        error: 'same_user',
-      });
+      return res.status(400).json({ error: 'same_user' });
     }
 
     item = inventory.splice(index, 1)[0];
@@ -1499,15 +1657,11 @@ app.post('/gifts/send', auth, async (req, res) => {
     const gift = GIFT_CAT[req.body.key];
 
     if (!gift) {
-      return res.status(400).json({
-        error: 'invalid_gift',
-      });
+      return res.status(400).json({ error: 'invalid_gift' });
     }
 
     if (!debit(source, user, gift.p, 'gift_buy')) {
-      return res.status(402).json({
-        error: 'insufficient_funds',
-      });
+      return res.status(402).json({ error: 'insufficient_funds' });
     }
 
     item = {
@@ -1518,9 +1672,7 @@ app.post('/gifts/send', auth, async (req, res) => {
   }
 
   item.ts = Date.now();
-  item.from = recipient.id === user.id
-    ? 'self'
-    : user.username;
+  item.from = recipient.id === user.id ? 'self' : user.username;
 
   (
     source.gifts[recipient.id] =
@@ -1560,12 +1712,23 @@ app.post('/messages', auth, (req, res) => {
   const { db: source, u: user } = c;
   const body = req.body || {};
 
+  const age = Date.now() - Number(user.createdAt || Date.now());
+  const limit = age < 24 * 60 * 60 * 1000 ? 10 : 30;
+
+  if (!enforceRateLimit(
+    req,
+    res,
+    `messages:user:${user.id}`,
+    limit,
+    60 * 1000
+  )) {
+    return;
+  }
+
   const recipient = resolveUser(source, body.to);
 
   if (!recipient) {
-    return res.status(404).json({
-      error: 'recipient_not_found',
-    });
+    return res.status(404).json({ error: 'recipient_not_found' });
   }
 
   const self = recipient.id === user.id;
@@ -1577,9 +1740,7 @@ app.post('/messages', auth, (req, res) => {
 
   const text = String(body.text || '').slice(0, 4000);
 
-  if (text) {
-    message.text = text;
-  }
+  if (text) message.text = text;
 
   if (body.file && typeof body.file === 'object') {
     message.file = {
@@ -1609,9 +1770,7 @@ app.post('/messages', auth, (req, res) => {
     !message.gift &&
     !message.numgift
   ) {
-    return res.status(400).json({
-      error: 'empty_message',
-    });
+    return res.status(400).json({ error: 'empty_message' });
   }
 
   addMsg(source, message);
@@ -1674,16 +1833,12 @@ app.delete('/messages/:id', auth, (req, res) => {
     !message ||
     (message.from !== user.id && message.to !== user.id)
   ) {
-    return res.status(404).json({
-      error: 'not_found',
-    });
+    return res.status(404).json({ error: 'not_found' });
   }
 
   if (req.query.all === '1') {
     if (message.from !== user.id) {
-      return res.status(403).json({
-        error: 'forbidden',
-      });
+      return res.status(403).json({ error: 'forbidden' });
     }
 
     message.del = true;
@@ -1702,7 +1857,6 @@ app.delete('/messages/:id', auth, (req, res) => {
   }
 
   message.seq = nextSeq(source);
-
   res.json({ ok: true });
 });
 
@@ -1728,10 +1882,7 @@ app.post('/chats/clear', auth, (req, res) => {
     }
   }
 
-  res.json({
-    ok: true,
-    n,
-  });
+  res.json({ ok: true, n });
 });
 
 // ==========================================
@@ -1740,10 +1891,7 @@ app.post('/chats/clear', auth, (req, res) => {
 
 app.use((error, _req, res, _next) => {
   console.error('[Nex error]', error);
-
-  res.status(500).json({
-    error: 'server_error',
-  });
+  res.status(500).json({ error: 'server_error' });
 });
 
 // ==========================================
@@ -1765,8 +1913,7 @@ async function start() {
         '';
 
       if (selfBase) {
-        const pingUrl =
-          selfBase.replace(/\/$/, '') + '/health';
+        const pingUrl = selfBase.replace(/\/$/, '') + '/health';
 
         console.log('[Nex] Self-ping enabled');
 
