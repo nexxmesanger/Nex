@@ -91,11 +91,13 @@ function fill(data) {
   if (!result.numbers || typeof result.numbers !== 'object') result.numbers = {};
   if (!result.numOtps || typeof result.numOtps !== 'object') result.numOtps = {};
 
+  if (!Number.isSafeInteger(result.seq) || result.seq < 0) {
+    result.seq = 0;
+  }
+
   return result;
 }
 
-// One shared in-memory state.
-// All routes work with this state.
 let db = emptyDb();
 let dbReady = false;
 
@@ -112,6 +114,10 @@ function persistentSnapshot(source) {
     gifts: source.gifts || {},
     numbers: source.numbers || {},
     numOtps: source.numOtps || {},
+
+    // Only the numeric cursor is persisted.
+    // Message contents are NEVER included.
+    seq: Number.isSafeInteger(source.seq) ? source.seq : 0,
   };
 }
 
@@ -122,22 +128,47 @@ function load() {
 function save(source) {
   const snapshot = persistentSnapshot(source);
 
-  saveQueue = saveQueue
+  const operation = saveQueue
     .catch(() => {})
     .then(async () => {
-      await pool.query(
+      const result = await pool.query(
         `UPDATE nex_app_state
          SET state = $1::jsonb,
              updated_at = NOW()
          WHERE id = 1`,
         [JSON.stringify(snapshot)]
       );
-    })
-    .catch((error) => {
-      console.error('[Nex DB] Save failed:', error.message);
+
+      if (result.rowCount !== 1) {
+        throw new Error('Persistent state row is missing');
+      }
+
+      return true;
     });
 
-  return saveQueue;
+  saveQueue = operation.catch((error) => {
+    dbReady = false;
+    console.error('[Nex DB] Save failed:', error.message);
+    return false;
+  });
+
+  return saveQueue.then((saved) => {
+    if (saved) dbReady = true;
+    return saved;
+  });
+}
+
+async function persistOrRespond(source, res) {
+  const saved = await save(source);
+
+  if (!saved) {
+    res.status(503).json({
+      error: 'database_unavailable',
+    });
+    return false;
+  }
+
+  return true;
 }
 
 function readLegacyDb() {
@@ -177,19 +208,16 @@ async function initDatabase() {
 
     // Never restore messages from the database.
     db.msgs = [];
-    db.seq = 0;
 
     console.log('[Nex DB] Existing Neon state loaded');
   } else {
     const legacy = readLegacyDb();
 
     if (legacy) {
-      // Persistent account and inventory data is imported.
+      // Import persistent account and inventory data only.
       // Old messages are intentionally discarded.
       db = fill(persistentSnapshot(legacy));
-
       db.msgs = [];
-      db.seq = 0;
 
       const imported = await pool.query(
         `INSERT INTO nex_app_state (id, state)
@@ -205,7 +233,6 @@ async function initDatabase() {
         console.log('[Nex DB] Another instance initialized the database; loading Neon state');
       }
 
-      // Always load the actual database state after the insert attempt.
       const actual = await pool.query(
         'SELECT state FROM nex_app_state WHERE id = 1'
       );
@@ -213,7 +240,6 @@ async function initDatabase() {
       if (actual.rows.length) {
         db = fill(actual.rows[0].state);
         db.msgs = [];
-        db.seq = 0;
       }
     } else {
       db = emptyDb();
@@ -232,7 +258,6 @@ async function initDatabase() {
       if (actual.rows.length) {
         db = fill(actual.rows[0].state);
         db.msgs = [];
-        db.seq = 0;
       }
 
       console.log('[Nex DB] New empty state initialized');
@@ -318,7 +343,6 @@ async function sendOtp(email, code) {
     </div>
   `;
 
-  // RESEND
   if (process.env.RESEND_API_KEY) {
     const response = await fetch(
       'https://api.resend.com/emails',
@@ -362,7 +386,6 @@ async function sendOtp(email, code) {
     };
   }
 
-  // SMTP FALLBACK
   const tx = getTransporter();
 
   if (tx) {
@@ -382,7 +405,6 @@ async function sendOtp(email, code) {
     };
   }
 
-  // LOCAL DEVELOPMENT ONLY
   if (process.env.NODE_ENV !== 'production') {
     console.log(`[Nex mail:dev] OTP for ${email}: ${code}`);
 
@@ -535,7 +557,7 @@ app.post('/auth/email', async (req, res) => {
       attempts: 0,
     };
 
-    await save(source);
+    if (!(await persistOrRespond(source, res))) return;
 
     const result = await sendOtp(email, code);
 
@@ -587,7 +609,8 @@ app.post('/auth/verify', async (req, res) => {
 
     if (Date.now() > otp.exp) {
       delete source.otps[email];
-      await save(source);
+
+      if (!(await persistOrRespond(source, res))) return;
 
       return res.status(400).json({
         error: 'otp_expired',
@@ -605,7 +628,7 @@ app.post('/auth/verify', async (req, res) => {
     const ok = await bcrypt.compare(code, otp.hash);
 
     if (!ok) {
-      await save(source);
+      if (!(await persistOrRespond(source, res))) return;
 
       return res.status(400).json({
         error: 'otp_invalid',
@@ -657,7 +680,7 @@ app.post('/auth/verify', async (req, res) => {
       );
     }
 
-    await save(source);
+    if (!(await persistOrRespond(source, res))) return;
 
     res.json({
       token: signToken(userId),
@@ -745,7 +768,7 @@ app.patch('/me', auth, async (req, res) => {
     source.usernames[username] = req.userId;
   }
 
-  await save(source);
+  if (!(await persistOrRespond(source, res))) return;
 
   res.json(
     mePayload(user, balanceOf(source, req.userId))
@@ -881,7 +904,7 @@ app.post('/wallet/topup-test', auth, async (req, res) => {
 
   source.ledger.push(entry);
 
-  await save(source);
+  if (!(await persistOrRespond(source, res))) return;
 
   res.json({
     balance: balanceOf(source, req.userId),
@@ -926,7 +949,12 @@ const numList = (user) =>
   }));
 
 function nextSeq(source) {
-  source.seq = (source.seq || 0) + 1;
+  const previous = Number.isSafeInteger(source.seq) ? source.seq : 0;
+
+  // Timestamp-based cursor avoids resetting to zero after a restart.
+  // It stores no message content.
+  source.seq = Math.max(previous + 1, Date.now());
+
   return source.seq;
 }
 
@@ -1055,7 +1083,7 @@ app.post('/auth/guest', async (req, res) => {
     'Вы вошли как гость на 24 часа. Покупки и подарки недоступны.'
   );
 
-  await save(source);
+  if (!(await persistOrRespond(source, res))) return;
 
   res.json({
     token: jwt.sign(
@@ -1092,6 +1120,7 @@ setInterval(async () => {
     (message) => !ids.has(message.from) && !ids.has(message.to)
   );
 
+  // Background task: no HTTP response to send.
   await save(source);
 }, 60 * 60 * 1000);
 
@@ -1143,7 +1172,7 @@ app.post('/auth/number', async (req, res) => {
       `Код входа по номеру ${fmtNum(number)}: ${code}\nНикому его не сообщайте. Действует 10 минут.`
     );
 
-    await save(source);
+    if (!(await persistOrRespond(source, res))) return;
 
     res.json({
       ok: true,
@@ -1180,7 +1209,8 @@ app.post('/auth/number/verify', async (req, res) => {
 
     if (Date.now() > otp.exp) {
       delete source.numOtps[number];
-      await save(source);
+
+      if (!(await persistOrRespond(source, res))) return;
 
       return res.status(400).json({
         error: 'otp_expired',
@@ -1196,7 +1226,7 @@ app.post('/auth/number/verify', async (req, res) => {
     otp.attempts += 1;
 
     if (!(await bcrypt.compare(code, otp.hash))) {
-      await save(source);
+      if (!(await persistOrRespond(source, res))) return;
 
       return res.status(400).json({
         error: 'otp_invalid',
@@ -1207,7 +1237,7 @@ app.post('/auth/number/verify', async (req, res) => {
 
     const user = source.users[source.numbers[number]];
 
-    await save(source);
+    if (!(await persistOrRespond(source, res))) return;
 
     if (!user) {
       return res.status(404).json({
@@ -1318,7 +1348,7 @@ app.post('/numbers/buy', auth, async (req, res) => {
     });
   }
 
-  await save(source);
+  if (!(await persistOrRespond(source, res))) return;
 
   res.json({
     balance: balanceOf(source, user.id),
@@ -1344,7 +1374,7 @@ app.post('/numbers/main', auth, async (req, res) => {
 
   c.u.mainNumber = number;
 
-  await save(c.db);
+  if (!(await persistOrRespond(c.db, res))) return;
 
   res.json({
     numbers: numList(c.u),
@@ -1407,7 +1437,7 @@ app.post('/numbers/give', auth, async (req, res) => {
     numgift: fmtNum(number),
   });
 
-  await save(source);
+  if (!(await persistOrRespond(source, res))) return;
 
   res.json({
     numbers: numList(user),
@@ -1510,7 +1540,7 @@ app.post('/gifts/send', auth, async (req, res) => {
     });
   }
 
-  await save(source);
+  if (!(await persistOrRespond(source, res))) return;
 
   res.json({
     item,
